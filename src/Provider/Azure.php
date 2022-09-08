@@ -14,6 +14,7 @@ use League\OAuth2\Client\Tool\BearerAuthorizationTrait;
 use Psr\Http\Message\ResponseInterface;
 use TheNetworg\OAuth2\Client\Grant\JwtBearer;
 use TheNetworg\OAuth2\Client\Token\AccessToken;
+use UnexpectedValueException;
 
 class Azure extends AbstractProvider
 {
@@ -27,6 +28,10 @@ class Azure extends AbstractProvider
 
     /** @var array|null */
     protected $openIdConfiguration;
+
+    public $certificate;
+
+    public $certificatePath;
 
     public $scope = [];
 
@@ -103,6 +108,34 @@ class Azure extends AbstractProvider
         return $openIdConfiguration['token_endpoint'];
     }
 
+    private function guidv4()
+    {
+        $data = random_bytes(16);
+        $data[6] = chr(ord($data[6]) & 0x0f | 0x40); // set version to 0100
+        $data[8] = chr(ord($data[8]) & 0x3f | 0x80); // set bits 6-7 to 10
+
+        return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+    }
+
+    private function generateClientAssertion(): string
+    {
+        $payload = [
+            'aud' => $this->clientId,
+            // Token is only needed to get the access_token, can expire it right away, but set to 10 minutes to avoid clock drift issues.
+            'exp' => time() + (60 * 10),
+            'iss' => $this->urlLogin . $this->tenant . $this->getVersionUriInfix($this->defaultEndPointVersion) . '/oauth2/token',
+            'jti' => $this->guidv4(),
+
+            // 10 minutes in the past
+            'nbf' => time() - (60 * 10),
+//            'sub' => $this->clientId,
+        ];
+
+        $certificate = $this->certificate ?? file_get_contents($this->certificate);
+
+        return JWT::encode($payload, $certificate, 'HS256');
+    }
+
     /**
      * @inheritdoc
      */
@@ -117,7 +150,32 @@ class Azure extends AbstractProvider
                 $options['resource'] = $this->resource ? $this->resource : $this->urlAPI;
             }
         }
-        return parent::getAccessToken($grant, $options);
+
+        $grant = $this->verifyGrant($grant);
+
+        $params = [
+            'client_id' => $this->clientId,
+            'redirect_uri' => $this->redirectUri,
+        ];
+
+        if ($this->certificate || $this->certificatePath) {
+            $params['client_assertion'] = $this->generateClientAssertion();
+        } else {
+            $params['client_secret'] = $this->clientSecret;
+        }
+
+        $params   = $grant->prepareRequestParameters($params, $options);
+        $request  = $this->getAccessTokenRequest($params);
+        $response = $this->getParsedResponse($request);
+        if (false === is_array($response)) {
+            throw new UnexpectedValueException(
+                'Invalid response received from Authorization Server. Expected JSON.'
+            );
+        }
+        $prepared = $this->prepareAccessTokenResponse($response);
+        $token    = $this->createAccessToken($prepared, $grant);
+
+        return $token;
     }
 
     /**
